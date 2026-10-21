@@ -10,7 +10,7 @@ $exe = "$destino\lancador.exe"
 New-Item -ItemType Directory -Force $destino | Out-Null
 if (Test-Path $exe) {
     & $exe --sair
-    Get-Process lancador -ErrorAction SilentlyContinue | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    try { Get-Process lancador -ErrorAction Stop | Wait-Process -Timeout 5 -ErrorAction Stop } catch {}
 }
 Copy-Item target\release\lancador.exe $exe -Force
 Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name lancador -Value "`"$exe`""

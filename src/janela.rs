@@ -1,18 +1,35 @@
-//! Janela única, escondida até o Alt+Space. Campo EDIT nativo e lista desenhada em GDI.
+//! Janela única, escondida até o Alt+Space. Fundo acrílico do DWM; o conteúdo é desenhado em
+//! Direct2D num DIB de 32 bits com alfa e copiado para a área cliente (frame estendido).
+//! O campo de busca é próprio: o EDIT do Win32 pinta fundo opaco e furaria o acrílico.
 
-use std::{collections::HashMap, fs, ptr::null_mut};
+use std::{
+    collections::HashMap,
+    fs,
+    ptr::null_mut,
+    time::Instant,
+};
 
 use windows::{
     core::{w, HSTRING, PCWSTR},
     Win32::{
         Foundation::*,
-        Graphics::{Dwm::*, Gdi::*},
+        Graphics::{
+            Direct2D::{Common::*, *},
+            DirectWrite::*,
+            Dwm::*,
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Gdi::*,
+            Imaging::*,
+        },
         System::{
-            Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
+            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED},
+            DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
             LibraryLoader::GetModuleHandleW,
+            Memory::{GlobalLock, GlobalUnlock},
             Threading::CreateMutexW,
         },
         UI::{
+            Controls::MARGINS,
             HiDpi::*,
             Input::KeyboardAndMouse::*,
             Shell::{ShellExecuteExW, SHELLEXECUTEINFOW},
@@ -21,53 +38,85 @@ use windows::{
     },
 };
 
-use windows::Win32::UI::Controls::EM_SETSEL;
-
 use crate::{
     busca,
-    itens::{self, Item},
+    itens::{self, Icone, Item},
 };
 
 const CLASSE: PCWSTR = w!("LancadorRs");
 const WM_FIXADOS: u32 = WM_APP + 1;
 const WM_MOSTRAR: u32 = WM_APP + 2;
-const EN_CHANGE: u32 = 0x0300;
-const MAX_VISIVEIS: usize = 9;
+const TIMER_ANIM: usize = 1;
+const TIMER_CARET: usize = 2;
+const MAX_VISIVEIS: usize = 8;
 
-// Medidas a 96 dpi.
-const LARGURA: i32 = 640;
-const MARGEM: i32 = 8;
-const ALT_BUSCA: i32 = 52;
-const ALT_ITEM: i32 = 46;
-const TAM_ICONE: i32 = 32;
+// Medidas em DIPs.
+const LARGURA: f32 = 680.0;
+const ALT_BUSCA: f32 = 60.0;
+const ALT_ITEM: f32 = 44.0;
+const TOPO_LISTA: f32 = ALT_BUSCA + 6.0;
+const FUNDO_LISTA: f32 = 8.0;
+const X_TEXTO_BUSCA: f32 = 22.0;
+const X_ICONE: f32 = 22.0;
+const TAM_ICONE: f32 = 26.0;
+const X_NOME: f32 = 62.0;
 
-const fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
-    COLORREF(r | (g << 8) | (b << 16))
+// Constantes de tempo das animações (s): exponencial, sem fim abrupto.
+const TAU_SELECAO: f32 = 0.045;
+const TAU_ALTURA: f32 = 0.06;
+const DUR_ABERTURA: f32 = 0.16;
+
+const fn cor(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a }
 }
-const COR_FUNDO: COLORREF = rgb(32, 32, 32);
-const COR_SELECAO: COLORREF = rgb(56, 56, 56);
-const COR_SEPARADOR: COLORREF = rgb(58, 58, 58);
-const COR_TEXTO: COLORREF = rgb(240, 240, 240);
-const COR_DETALHE: COLORREF = rgb(150, 150, 150);
-const COR_DESTAQUE: COLORREF = rgb(76, 194, 255);
+/// Véu sobre o acrílico: garante contraste em papel de parede claro.
+const COR_VEU: D2D1_COLOR_F = cor(22, 22, 24, 0.66);
+const COR_TEXTO: D2D1_COLOR_F = cor(255, 255, 255, 0.94);
+const COR_DICA: D2D1_COLOR_F = cor(255, 255, 255, 0.46);
+const COR_NOME: D2D1_COLOR_F = cor(255, 255, 255, 0.86);
+const COR_GLIFO: D2D1_COLOR_F = cor(255, 255, 255, 0.80);
+const COR_SELECAO: D2D1_COLOR_F = cor(255, 255, 255, 0.085);
+const COR_LINHA: D2D1_COLOR_F = cor(255, 255, 255, 0.07);
+const COR_MARCA_TEXTO: D2D1_COLOR_F = cor(96, 205, 255, 0.38);
+
+struct Desenho {
+    dw: IDWriteFactory,
+    wic: IWICImagingFactory,
+    fabrica: ID2D1Factory,
+    rt: ID2D1DCRenderTarget,
+    pincel: ID2D1SolidColorBrush,
+    fmt_busca: IDWriteTextFormat,
+    fmt_nome: IDWriteTextFormat,
+    fmt_glifo: IDWriteTextFormat,
+    bitmaps: HashMap<String, ID2D1Bitmap>,
+    memdc: HDC,
+    dib: HBITMAP,
+    dib_tam: (i32, i32),
+}
 
 struct Estado {
     hwnd: HWND,
-    edit: HWND,
+    d: Desenho,
     fixados: Vec<Item>,
     sistema: Vec<Item>,
     /// (é fixado, índice na lista)
     resultados: Vec<(bool, usize)>,
     sel: usize,
     topo: usize,
+    texto: Vec<char>,
+    cursor: usize,
+    tudo_marcado: bool,
+    caret_aceso: bool,
     uso: HashMap<String, u32>,
-    dpi: u32,
-    fonte_busca: HFONT,
-    fonte_nome: HFONT,
-    fonte_detalhe: HFONT,
-    pincel_fundo: HBRUSH,
+    escala: f32,
     exportando: bool,
     mouse: (i32, i32),
+    // animação
+    sel_y: f32,
+    altura: f32,
+    abertura: Option<Instant>,
+    ultimo_quadro: Instant,
+    animando: bool,
 }
 
 // Só a thread da janela toca no estado.
@@ -75,10 +124,6 @@ static mut ESTADO: *mut Estado = null_mut();
 
 fn st() -> &'static mut Estado {
     unsafe { &mut *ESTADO }
-}
-
-fn esc(v: i32) -> i32 {
-    v * st().dpi as i32 / 96
 }
 
 pub fn rodar() {
@@ -112,60 +157,54 @@ pub fn rodar() {
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             CLASSE,
             w!("Lançador"),
-            WS_POPUP | WS_CLIPCHILDREN,
+            WS_POPUP,
             0,
             0,
-            LARGURA,
-            100,
+            LARGURA as i32,
+            ALT_BUSCA as i32,
             None,
-            None,
-            Some(inst),
-            None,
-        )
-        .unwrap();
-        let edit = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("EDIT"),
-            w!(""),
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-            0,
-            0,
-            10,
-            10,
-            Some(hwnd),
             None,
             Some(inst),
             None,
         )
         .unwrap();
 
+        let sim: i32 = 1;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &sim as *const _ as _, 4);
+        let fundo = DWMSBT_TRANSIENTWINDOW;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &fundo as *const _ as _, 4);
         let canto = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &canto as *const _ as _, 4);
-        let borda = rgb(70, 70, 70);
+        let borda = COLORREF(0x003c3c3c);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borda as *const _ as _, 4);
+        let _ = DwmExtendFrameIntoClientArea(
+            hwnd,
+            &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 },
+        );
 
-        let dpi = GetDpiForWindow(hwnd).max(96);
+        let escala = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
         ESTADO = Box::into_raw(Box::new(Estado {
             hwnd,
-            edit,
-            fixados: Vec::new(),
-            sistema: Vec::new(),
+            d: criar_desenho().expect("Direct2D"),
+            fixados: itens::carregar_fixados(),
+            sistema: itens::carregar_sistema(),
             resultados: Vec::new(),
             sel: 0,
             topo: 0,
+            texto: Vec::new(),
+            cursor: 0,
+            tudo_marcado: false,
+            caret_aceso: true,
             uso: carregar_uso(),
-            dpi,
-            fonte_busca: HFONT::default(),
-            fonte_nome: HFONT::default(),
-            fonte_detalhe: HFONT::default(),
-            pincel_fundo: CreateSolidBrush(COR_FUNDO),
+            escala,
             exportando: false,
             mouse: (-1, -1),
+            sel_y: 0.0,
+            altura: ALT_BUSCA,
+            abertura: None,
+            ultimo_quadro: Instant::now(),
+            animando: false,
         }));
-        criar_fontes();
-        let tam = esc(TAM_ICONE);
-        st().fixados = itens::carregar_fixados(tam);
-        st().sistema = itens::carregar_sistema(tam);
         atualizar_busca();
         verificar_fixados();
 
@@ -176,36 +215,65 @@ pub fn rodar() {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.hwnd == edit && tecla_do_campo(&msg) {
-                continue;
-            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
 }
 
-/// Teclas de navegação no campo de busca. true = consumida.
-unsafe fn tecla_do_campo(msg: &MSG) -> bool {
-    let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
-    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-    match msg.message {
-        WM_KEYDOWN => match VIRTUAL_KEY(msg.wParam.0 as u16) {
-            VK_DOWN => mover(1),
-            VK_UP => mover(-1),
-            VK_TAB => mover(if shift { -1 } else { 1 }),
-            VK_NEXT => mover(MAX_VISIVEIS as i32),
-            VK_PRIOR => mover(-(MAX_VISIVEIS as i32)),
-            VK_RETURN => abrir(ctrl && shift),
-            VK_ESCAPE => esconder(),
-            VK_BACK if ctrl => apagar_palavra(),
-            _ => return false,
-        },
-        // Sem o WM_CHAR desses o EDIT apita.
-        WM_CHAR => return matches!(msg.wParam.0, 0x0d | 0x1b | 0x09 | 0x7f),
-        _ => return false,
-    }
-    true
+unsafe fn criar_desenho() -> windows::core::Result<Desenho> {
+    let fabrica: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+    let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+    let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+    let rt = criar_alvo(&fabrica)?;
+    let pincel = rt.CreateSolidColorBrush(&COR_TEXTO, None)?;
+
+    let formato = |familia: PCWSTR, peso: DWRITE_FONT_WEIGHT, tam: f32| -> windows::core::Result<IDWriteTextFormat> {
+        let f = dw.CreateTextFormat(familia, None, peso, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, tam, w!("pt-BR"))?;
+        f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        Ok(f)
+    };
+    let fmt_busca = formato(w!("Segoe UI Variable Display"), DWRITE_FONT_WEIGHT_SEMI_LIGHT, 22.0)?;
+    let fmt_nome = formato(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_NORMAL, 14.5)?;
+    let reticencias = dw.CreateEllipsisTrimmingSign(&fmt_nome)?;
+    fmt_nome.SetTrimming(
+        &DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, ..Default::default() },
+        &reticencias,
+    )?;
+    let fmt_glifo = formato(w!("Segoe Fluent Icons"), DWRITE_FONT_WEIGHT_NORMAL, 17.0)?;
+    fmt_glifo.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+
+    Ok(Desenho {
+        dw,
+        wic,
+        fabrica,
+        rt,
+        pincel,
+        fmt_busca,
+        fmt_nome,
+        fmt_glifo,
+        bitmaps: HashMap::new(),
+        memdc: CreateCompatibleDC(None),
+        dib: HBITMAP::default(),
+        dib_tam: (0, 0),
+    })
+}
+
+unsafe fn criar_alvo(fabrica: &ID2D1Factory) -> windows::core::Result<ID2D1DCRenderTarget> {
+    let props = D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+        dpiX: 0.0,
+        dpiY: 0.0,
+        usage: D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
+        minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+    };
+    // Software: a janela e pequena e o modo hardware carrega o driver da GPU (~50 MB privados).
+    let rt = fabrica.CreateDCRenderTarget(&props)?;
+    // Cinza (não ClearType): o ClearType não sabe misturar com fundo translúcido.
+    rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    Ok(rt)
 }
 
 unsafe extern "system" fn proc_janela(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -223,7 +291,8 @@ unsafe extern "system" fn proc_janela(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         WM_MOSTRAR => mostrar(),
         WM_FIXADOS => {
             st().exportando = false;
-            st().fixados = itens::carregar_fixados(esc(TAM_ICONE));
+            st().d.bitmaps.clear();
+            st().fixados = itens::carregar_fixados();
             atualizar_busca();
         }
         WM_ACTIVATE => {
@@ -231,17 +300,20 @@ unsafe extern "system" fn proc_janela(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 esconder();
             }
         }
-        WM_COMMAND => {
-            if ((wp.0 >> 16) & 0xffff) as u32 == EN_CHANGE {
-                atualizar_busca();
+        WM_KEYDOWN => tecla(VIRTUAL_KEY(wp.0 as u16)),
+        WM_CHAR => {
+            if let Some(c) = char::from_u32(wp.0 as u32).filter(|c| !c.is_control()) {
+                inserir(&[c]);
             }
         }
-        WM_CTLCOLOREDIT => {
-            let hdc = HDC(wp.0 as _);
-            SetTextColor(hdc, COR_TEXTO);
-            SetBkColor(hdc, COR_FUNDO);
-            return LRESULT(st().pincel_fundo.0 as isize);
-        }
+        WM_TIMER => match wp.0 {
+            TIMER_ANIM => quadro(),
+            TIMER_CARET => {
+                st().caret_aceso = !st().caret_aceso;
+                redesenhar();
+            }
+            _ => {}
+        },
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => pintar(hwnd),
         WM_MOUSEMOVE => {
@@ -252,7 +324,7 @@ unsafe extern "system" fn proc_janela(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if let Some(i) = linha_em(p.1) {
                     if i != st().sel {
                         st().sel = i;
-                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        animar();
                     }
                 }
             }
@@ -265,9 +337,8 @@ unsafe extern "system" fn proc_janela(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_MOUSEWHEEL => mover(if ((wp.0 >> 16) & 0xffff) as i16 > 0 { -1 } else { 1 }),
         WM_DPICHANGED => {
-            st().dpi = ((wp.0 & 0xffff) as u32).max(96);
-            criar_fontes();
-            ajustar_tamanho();
+            st().escala = ((wp.0 & 0xffff) as u32).max(96) as f32 / 96.0;
+            aplicar_tamanho();
         }
         WM_DESTROY => PostQuitMessage(0),
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
@@ -275,31 +346,132 @@ unsafe extern "system" fn proc_janela(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     LRESULT(0)
 }
 
-unsafe fn criar_fontes() {
+// ---------- campo de busca ----------
+
+unsafe fn tecla(vk: VIRTUAL_KEY) {
+    let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
     let s = st();
-    for f in [s.fonte_busca, s.fonte_nome, s.fonte_detalhe] {
-        if !f.is_invalid() {
-            let _ = DeleteObject(f.into());
+    match vk {
+        VK_DOWN => mover(1),
+        VK_UP => mover(-1),
+        VK_TAB => mover(if shift { -1 } else { 1 }),
+        VK_NEXT => mover(MAX_VISIVEIS as i32),
+        VK_PRIOR => mover(-(MAX_VISIVEIS as i32)),
+        VK_RETURN => abrir(ctrl && shift),
+        VK_ESCAPE => esconder(),
+        VK_BACK | VK_DELETE if s.tudo_marcado => {
+            s.texto.clear();
+            s.cursor = 0;
+            texto_mudou();
         }
+        VK_BACK if s.cursor > 0 => {
+            let inicio = if ctrl { inicio_palavra(&s.texto, s.cursor) } else { s.cursor - 1 };
+            s.texto.drain(inicio..s.cursor);
+            s.cursor = inicio;
+            texto_mudou();
+        }
+        VK_DELETE if s.cursor < s.texto.len() => {
+            s.texto.remove(s.cursor);
+            texto_mudou();
+        }
+        VK_LEFT | VK_RIGHT | VK_HOME | VK_END => {
+            s.cursor = match vk {
+                VK_HOME => 0,
+                VK_END => s.texto.len(),
+                VK_LEFT if ctrl => inicio_palavra(&s.texto, s.cursor),
+                VK_LEFT => s.cursor.saturating_sub(1),
+                _ if ctrl => fim_palavra(&s.texto, s.cursor),
+                _ => (s.cursor + 1).min(s.texto.len()),
+            };
+            s.tudo_marcado = false;
+            acender_caret();
+        }
+        VIRTUAL_KEY(0x41) if ctrl => {
+            s.tudo_marcado = !s.texto.is_empty();
+            redesenhar();
+        }
+        VIRTUAL_KEY(0x56) if ctrl => {
+            let colado: Vec<char> = area_de_transferencia().lines().next().unwrap_or("").chars().collect();
+            inserir(&colado);
+        }
+        _ => {}
     }
-    let fonte = |px: i32, peso: i32| {
-        let mut lf = LOGFONTW {
-            lfHeight: -esc(px),
-            lfWeight: peso,
-            lfCharSet: DEFAULT_CHARSET,
-            lfQuality: CLEARTYPE_QUALITY,
-            ..Default::default()
-        };
-        for (i, c) in "Segoe UI".encode_utf16().enumerate() {
-            lf.lfFaceName[i] = c;
-        }
-        CreateFontIndirectW(&lf)
-    };
-    s.fonte_busca = fonte(22, 400);
-    s.fonte_nome = fonte(15, 400);
-    s.fonte_detalhe = fonte(12, 400);
-    SendMessageW(s.edit, WM_SETFONT, Some(WPARAM(s.fonte_busca.0 as usize)), Some(LPARAM(1)));
 }
+
+fn inicio_palavra(t: &[char], mut i: usize) -> usize {
+    while i > 0 && t[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !t[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+fn fim_palavra(t: &[char], mut i: usize) -> usize {
+    while i < t.len() && t[i].is_whitespace() {
+        i += 1;
+    }
+    while i < t.len() && !t[i].is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+unsafe fn inserir(cs: &[char]) {
+    if cs.is_empty() {
+        return;
+    }
+    let s = st();
+    if s.tudo_marcado {
+        s.texto.clear();
+        s.cursor = 0;
+    }
+    for (i, &c) in cs.iter().enumerate() {
+        s.texto.insert(s.cursor + i, c);
+    }
+    s.cursor += cs.len();
+    texto_mudou();
+}
+
+unsafe fn texto_mudou() {
+    st().tudo_marcado = false;
+    atualizar_busca();
+    acender_caret();
+}
+
+/// Caret aceso logo depois de digitar/mover, e o pisca recomeça.
+unsafe fn acender_caret() {
+    let s = st();
+    s.caret_aceso = true;
+    if IsWindowVisible(s.hwnd).as_bool() {
+        SetTimer(Some(s.hwnd), TIMER_CARET, GetCaretBlinkTime(), None);
+    }
+    redesenhar();
+}
+
+unsafe fn area_de_transferencia() -> String {
+    let mut texto = String::new();
+    if OpenClipboard(Some(st().hwnd)).is_ok() {
+        if let Ok(h) = GetClipboardData(13) {
+            // CF_UNICODETEXT
+            let p = GlobalLock(HGLOBAL(h.0)) as *const u16;
+            if !p.is_null() {
+                let mut n = 0;
+                while *p.add(n) != 0 {
+                    n += 1;
+                }
+                texto = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+                let _ = GlobalUnlock(HGLOBAL(h.0));
+            }
+        }
+        let _ = CloseClipboard();
+    }
+    texto
+}
+
+// ---------- resultados ----------
 
 fn item(r: (bool, usize)) -> &'static Item {
     let s = st();
@@ -310,15 +482,9 @@ fn item(r: (bool, usize)) -> &'static Item {
     }
 }
 
-fn texto_do_campo() -> String {
-    let mut buf = [0u16; 512];
-    let n = unsafe { GetWindowTextW(st().edit, &mut buf) } as usize;
-    String::from_utf16_lossy(&buf[..n])
-}
-
 unsafe fn atualizar_busca() {
-    let consulta = busca::dobrar(texto_do_campo().trim());
     let s = st();
+    let consulta = busca::dobrar(s.texto.iter().collect::<String>().trim());
     s.resultados = if consulta.is_empty() {
         (0..s.fixados.len()).map(|i| (true, i)).collect()
     } else {
@@ -346,54 +512,31 @@ unsafe fn atualizar_busca() {
     };
     s.sel = 0;
     s.topo = 0;
-    ajustar_tamanho();
-    let _ = InvalidateRect(Some(s.hwnd), None, false);
+    animar();
 }
 
 fn visiveis() -> usize {
     st().resultados.len().min(MAX_VISIVEIS)
 }
 
-fn topo_lista() -> i32 {
-    esc(MARGEM + ALT_BUSCA) + esc(5)
-}
-
-fn altura() -> i32 {
+fn altura_alvo() -> f32 {
     match visiveis() {
-        0 => esc(MARGEM * 2 + ALT_BUSCA),
-        n => topo_lista() + n as i32 * esc(ALT_ITEM) + esc(MARGEM),
+        0 => ALT_BUSCA,
+        n => TOPO_LISTA + n as f32 * ALT_ITEM + FUNDO_LISTA,
     }
 }
 
-unsafe fn ajustar_tamanho() {
-    let s = st();
-    let _ = SetWindowPos(
-        s.hwnd,
-        None,
-        0,
-        0,
-        esc(LARGURA),
-        altura(),
-        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-    );
-    let alt_edit = esc(30);
-    let _ = SetWindowPos(
-        s.edit,
-        None,
-        esc(20),
-        esc(MARGEM) + (esc(ALT_BUSCA) - alt_edit) / 2,
-        esc(LARGURA - 40),
-        alt_edit,
-        SWP_NOZORDER | SWP_NOACTIVATE,
-    );
+fn px(dip: f32) -> i32 {
+    (dip * st().escala).ceil() as i32
 }
 
+/// Linha sob o y do mouse (pixels do cliente).
 fn linha_em(y: i32) -> Option<usize> {
-    let t = topo_lista();
-    if y < t {
+    let y = y as f32 / st().escala - TOPO_LISTA;
+    if y < 0.0 {
         return None;
     }
-    let i = ((y - t) / esc(ALT_ITEM)) as usize;
+    let i = (y / ALT_ITEM) as usize;
     (i < visiveis()).then(|| st().topo + i)
 }
 
@@ -413,18 +556,10 @@ unsafe fn mover(d: i32) {
     } else if s.sel >= s.topo + MAX_VISIVEIS {
         s.topo = s.sel + 1 - MAX_VISIVEIS;
     }
-    let _ = InvalidateRect(Some(s.hwnd), None, false);
+    animar();
 }
 
-unsafe fn apagar_palavra() {
-    let t = texto_do_campo();
-    let t = t.trim_end();
-    let corte = t.rfind(char::is_whitespace).map_or(0, |i| i + 1);
-    let novo = HSTRING::from(&t[..corte]);
-    let _ = SetWindowTextW(st().edit, &novo);
-    let n = novo.len();
-    SendMessageW(st().edit, EM_SETSEL, Some(WPARAM(n)), Some(LPARAM(n as isize)));
-}
+// ---------- mostrar / esconder / abrir ----------
 
 unsafe fn mostrar() {
     verificar_fixados();
@@ -436,22 +571,25 @@ unsafe fn mostrar() {
     let _ = GetMonitorInfoW(mon, &mut mi);
     let (mut dx, mut dy) = (96, 96);
     let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
-    if dx != s.dpi {
-        s.dpi = dx.max(96);
-        criar_fontes();
-    }
+    s.escala = dx.max(96) as f32 / 96.0;
+
+    // Abre já no tamanho final; a animação de abertura é só do conteúdo.
+    s.altura = altura_alvo();
+    s.sel_y = (s.sel - s.topo) as f32 * ALT_ITEM;
+    s.abertura = Some(Instant::now());
     let w = mi.rcWork;
-    let largura = esc(LARGURA);
+    let largura = px(LARGURA);
     let x = w.left + (w.right - w.left - largura) / 2;
     let y = w.top + (w.bottom - w.top) / 4;
-    let _ = SetWindowPos(s.hwnd, Some(HWND_TOPMOST), x, y, largura, altura(), SWP_NOACTIVATE);
-    ajustar_tamanho();
+    let _ = SetWindowPos(s.hwnd, Some(HWND_TOPMOST), x, y, largura, px(s.altura), SWP_NOACTIVATE);
     let _ = ShowWindow(s.hwnd, SW_SHOW);
     let _ = SetForegroundWindow(s.hwnd);
-    let _ = SetFocus(Some(s.edit));
+    let _ = SetFocus(Some(s.hwnd));
     let mut c = p;
     let _ = ScreenToClient(s.hwnd, &mut c);
     s.mouse = (c.x, c.y);
+    acender_caret();
+    animar();
 }
 
 /// Some e limpa: o próximo Alt+Space abre do zero, com os fixados.
@@ -461,7 +599,13 @@ unsafe fn esconder() {
         return;
     }
     let _ = ShowWindow(s.hwnd, SW_HIDE);
-    let _ = SetWindowTextW(s.edit, w!(""));
+    let _ = KillTimer(Some(s.hwnd), TIMER_ANIM);
+    let _ = KillTimer(Some(s.hwnd), TIMER_CARET);
+    s.animando = false;
+    s.texto.clear();
+    s.cursor = 0;
+    s.tudo_marcado = false;
+    atualizar_busca();
 }
 
 unsafe fn abrir(admin: bool) {
@@ -489,70 +633,275 @@ unsafe fn abrir(admin: bool) {
     }
 }
 
-unsafe fn pintar(hwnd: HWND) {
+// ---------- animação ----------
+
+unsafe fn animar() {
     let s = st();
+    if !IsWindowVisible(s.hwnd).as_bool() {
+        return;
+    }
+    if !s.animando {
+        s.animando = true;
+        s.ultimo_quadro = Instant::now();
+        SetTimer(Some(s.hwnd), TIMER_ANIM, 8, None);
+    }
+    quadro();
+}
+
+fn aproximar(atual: &mut f32, alvo: f32, dt: f32, tau: f32) -> bool {
+    *atual += (alvo - *atual) * (1.0 - (-dt / tau).exp());
+    if (alvo - *atual).abs() < 0.25 {
+        *atual = alvo;
+    }
+    *atual == alvo
+}
+
+unsafe fn quadro() {
+    let s = st();
+    let agora = Instant::now();
+    let dt = (agora - s.ultimo_quadro).as_secs_f32().min(0.05);
+    s.ultimo_quadro = agora;
+
+    let sel_ok = aproximar(&mut s.sel_y, (s.sel - s.topo) as f32 * ALT_ITEM, dt, TAU_SELECAO);
+    let antes = px(s.altura);
+    let alt_ok = aproximar(&mut s.altura, altura_alvo(), dt, TAU_ALTURA);
+    let abertura_ok = s.abertura.is_none_or(|t| t.elapsed().as_secs_f32() >= DUR_ABERTURA);
+    if abertura_ok {
+        s.abertura = None;
+    }
+    if px(s.altura) != antes {
+        aplicar_tamanho();
+    }
+    redesenhar();
+    if sel_ok && alt_ok && abertura_ok {
+        s.animando = false;
+        let _ = KillTimer(Some(s.hwnd), TIMER_ANIM);
+    }
+}
+
+unsafe fn aplicar_tamanho() {
+    let s = st();
+    let _ = SetWindowPos(
+        s.hwnd,
+        None,
+        0,
+        0,
+        px(LARGURA),
+        px(s.altura),
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+}
+
+unsafe fn redesenhar() {
+    let _ = InvalidateRect(Some(st().hwnd), None, false);
+}
+
+// ---------- pintura ----------
+
+unsafe fn pintar(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
-    let mem = CreateCompatibleDC(Some(hdc));
-    let bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-    let antigo = SelectObject(mem, bmp.into());
-
-    FillRect(mem, &rc, s.pincel_fundo);
-    SetBkMode(mem, TRANSPARENT);
-    let preencher = |r: RECT, cor: COLORREF| {
-        let b = CreateSolidBrush(cor);
-        FillRect(mem, &r, b);
-        let _ = DeleteObject(b.into());
-    };
-
-    if visiveis() > 0 {
-        let y = esc(MARGEM + ALT_BUSCA);
-        preencher(RECT { left: esc(12), top: y, right: rc.right - esc(12), bottom: y + 1 }, COR_SEPARADOR);
-    }
-    let alt = esc(ALT_ITEM);
-    let icone = esc(TAM_ICONE);
-    let x_texto = esc(18) + icone + esc(12);
-    for (vi, &r) in s.resultados.iter().skip(s.topo).take(MAX_VISIVEIS).enumerate() {
-        let it = item(r);
-        let y = topo_lista() + vi as i32 * alt;
-        if s.topo + vi == s.sel {
-            let b = CreateSolidBrush(COR_SELECAO);
-            let pb = SelectObject(mem, b.into());
-            let pp = SelectObject(mem, GetStockObject(NULL_PEN));
-            let _ = RoundRect(mem, esc(6), y + 1, rc.right - esc(6), y + alt - 1, esc(8), esc(8));
-            SelectObject(mem, pb);
-            SelectObject(mem, pp);
-            let _ = DeleteObject(b.into());
-            preencher(
-                RECT { left: esc(6), top: y + esc(13), right: esc(9), bottom: y + alt - esc(13) },
-                COR_DESTAQUE,
-            );
+    if rc.right > 0 && rc.bottom > 0 && preparar_dib(rc.right, rc.bottom) {
+        let d = &st().d;
+        if d.rt.BindDC(d.memdc, &rc).is_ok() {
+            let dpi = st().escala * 96.0;
+            d.rt.SetDpi(dpi, dpi);
+            d.rt.BeginDraw();
+            desenhar(rc.bottom as f32 / st().escala);
+            if d.rt.EndDraw(None, None).is_err() {
+                // Alvo perdido: recria; os bitmaps pertencem ao alvo antigo.
+                let s = st();
+                if let Ok(rt) = criar_alvo(&s.d.fabrica) {
+                    if let Ok(p) = rt.CreateSolidColorBrush(&COR_TEXTO, None) {
+                        s.d.rt = rt;
+                        s.d.pincel = p;
+                        s.d.bitmaps.clear();
+                    }
+                }
+            }
+            let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(st().d.memdc), 0, 0, SRCCOPY);
         }
-        if !it.icone.is_invalid() {
-            let _ = DrawIconEx(mem, esc(18), y + (alt - icone) / 2, it.icone, icone, icone, 0, None, DI_NORMAL);
-        }
-        let direita = rc.right - esc(16);
-        let mut nome: Vec<u16> = it.nome.encode_utf16().collect();
-        let mut detalhe: Vec<u16> = it.detalhe.encode_utf16().collect();
-        let fmt = DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | DT_VCENTER;
-        SelectObject(mem, s.fonte_nome.into());
-        SetTextColor(mem, COR_TEXTO);
-        let mut rn = RECT { left: x_texto, top: y + esc(4), right: direita, bottom: y + esc(25) };
-        DrawTextW(mem, &mut nome, &mut rn, fmt);
-        SelectObject(mem, s.fonte_detalhe.into());
-        SetTextColor(mem, COR_DETALHE);
-        let mut rd = RECT { left: x_texto, top: y + esc(25), right: direita, bottom: y + esc(42) };
-        DrawTextW(mem, &mut detalhe, &mut rd, fmt);
     }
-
-    let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(mem), 0, 0, SRCCOPY);
-    SelectObject(mem, antigo);
-    let _ = DeleteObject(bmp.into());
-    let _ = DeleteDC(mem);
     let _ = EndPaint(hwnd, &ps);
 }
+
+/// DIB de 32 bits do tamanho da janela (o alfa vai junto no BitBlt e o DWM respeita).
+unsafe fn preparar_dib(w: i32, h: i32) -> bool {
+    let d = &mut st().d;
+    if d.dib_tam.0 >= w && d.dib_tam.1 >= h && !d.dib.is_invalid() {
+        return true;
+    }
+    if !d.dib.is_invalid() {
+        let _ = DeleteObject(d.dib.into());
+    }
+    // Folga na altura para a janela crescer sem realocar a cada quadro.
+    let (w, h) = (w, h.max(px(TOPO_LISTA + MAX_VISIVEIS as f32 * ALT_ITEM + FUNDO_LISTA)));
+    let bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = null_mut();
+    match CreateDIBSection(Some(d.memdc), &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(b) => {
+            SelectObject(d.memdc, b.into());
+            d.dib = b;
+            d.dib_tam = (w, h);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn ret(l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {
+    D2D_RECT_F { left: l, top: t, right: r, bottom: b }
+}
+
+fn com_alfa(c: D2D1_COLOR_F, a: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { a: c.a * a, ..c }
+}
+
+fn suavizar(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+unsafe fn desenhar(altura: f32) {
+    let s = st();
+    let d = &s.d;
+    let rt = &d.rt;
+    let p = &d.pincel;
+    let pinta = |c: D2D1_COLOR_F| p.SetColor(&c);
+
+    rt.Clear(Some(&cor(0, 0, 0, 0.0)));
+    pinta(COR_VEU);
+    rt.FillRectangle(&ret(0.0, 0.0, LARGURA, altura), p);
+
+    // Abertura: o conteúdo desce 6 DIPs e aparece.
+    let t = s.abertura.map_or(1.0, |t| suavizar(t.elapsed().as_secs_f32() / DUR_ABERTURA));
+    let alfa = t;
+    let dy = (1.0 - t) * -6.0;
+
+    // Campo de busca.
+    let texto: Vec<u16> = s.texto.iter().collect::<String>().encode_utf16().collect();
+    let largura_campo = LARGURA - X_TEXTO_BUSCA * 2.0;
+    if texto.is_empty() {
+        pinta(com_alfa(COR_DICA, alfa));
+        let dica: Vec<u16> = "Pesquisar apps e configurações".encode_utf16().collect();
+        rt.DrawText(
+            &dica,
+            &d.fmt_busca,
+            &ret(X_TEXTO_BUSCA, dy, X_TEXTO_BUSCA + largura_campo, ALT_BUSCA + dy),
+            p,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
+    }
+    if let Ok(layout) = d.dw.CreateTextLayout(&texto, &d.fmt_busca, largura_campo, ALT_BUSCA) {
+        let pos16: usize = s.texto[..s.cursor].iter().map(|c| c.len_utf16()).sum();
+        let (mut cx, mut cy) = (0.0f32, 0.0f32);
+        let mut hm = DWRITE_HIT_TEST_METRICS::default();
+        let _ = layout.HitTestTextPosition(pos16 as u32, false, &mut cx, &mut cy, &mut hm);
+        let alt_linha = if hm.height > 0.0 { hm.height } else { 30.0 };
+        let topo_linha = (ALT_BUSCA - alt_linha) / 2.0 + dy;
+        if s.tudo_marcado {
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = layout.GetMetrics(&mut m);
+            pinta(com_alfa(COR_MARCA_TEXTO, alfa));
+            rt.FillRectangle(
+                &ret(X_TEXTO_BUSCA, topo_linha, X_TEXTO_BUSCA + m.widthIncludingTrailingWhitespace, topo_linha + alt_linha),
+                p,
+            );
+        }
+        if !texto.is_empty() {
+            pinta(com_alfa(COR_TEXTO, alfa));
+            rt.DrawText(
+                &texto,
+                &d.fmt_busca,
+                &ret(X_TEXTO_BUSCA, dy, X_TEXTO_BUSCA + largura_campo, ALT_BUSCA + dy),
+                p,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        if s.caret_aceso && !s.tudo_marcado {
+            pinta(com_alfa(COR_TEXTO, alfa));
+            let x = X_TEXTO_BUSCA + cx;
+            rt.FillRectangle(&ret(x, topo_linha + 3.0, x + 1.5, topo_linha + alt_linha - 3.0), p);
+        }
+    }
+
+    let n = visiveis();
+    if n == 0 {
+        return;
+    }
+    pinta(com_alfa(COR_LINHA, alfa));
+    rt.FillRectangle(&ret(0.0, ALT_BUSCA, LARGURA, ALT_BUSCA + 1.0), p);
+
+    rt.PushAxisAlignedClip(&ret(0.0, ALT_BUSCA + 1.0, LARGURA, altura), D2D1_ANTIALIAS_MODE_ALIASED);
+    let y0 = TOPO_LISTA + dy;
+    pinta(com_alfa(COR_SELECAO, alfa));
+    let ys = y0 + s.sel_y;
+    rt.FillRoundedRectangle(
+        &D2D1_ROUNDED_RECT { rect: ret(8.0, ys + 2.0, LARGURA - 8.0, ys + ALT_ITEM - 2.0), radiusX: 6.0, radiusY: 6.0 },
+        p,
+    );
+
+    for (vi, &r) in s.resultados.iter().skip(s.topo).take(MAX_VISIVEIS).enumerate() {
+        let it = item(r);
+        let y = y0 + vi as f32 * ALT_ITEM;
+        let caixa = ret(X_ICONE, y + (ALT_ITEM - TAM_ICONE) / 2.0, X_ICONE + TAM_ICONE, y + (ALT_ITEM + TAM_ICONE) / 2.0);
+        match it.icone {
+            Icone::Imagem(h) => {
+                if let Some(b) = bitmap_do_icone(&it.id(), h) {
+                    rt.DrawBitmap(&b, Some(&caixa), alfa, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                }
+            }
+            Icone::Glifo(g) => {
+                let mut buf = [0u16; 2];
+                pinta(com_alfa(COR_GLIFO, alfa));
+                rt.DrawText(g.encode_utf16(&mut buf), &d.fmt_glifo, &caixa, p, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            }
+            Icone::Nenhum => {}
+        }
+        let nome: Vec<u16> = it.nome.encode_utf16().collect();
+        pinta(com_alfa(if s.topo + vi == s.sel { COR_TEXTO } else { COR_NOME }, alfa));
+        rt.DrawText(
+            &nome,
+            &d.fmt_nome,
+            &ret(X_NOME, y, LARGURA - 20.0, y + ALT_ITEM),
+            p,
+            D2D1_DRAW_TEXT_OPTIONS_NONE,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
+    }
+    rt.PopAxisAlignedClip();
+}
+
+/// HICON → bitmap do Direct2D (PBGRA), guardado por item.
+unsafe fn bitmap_do_icone(id: &str, h: HICON) -> Option<ID2D1Bitmap> {
+    let d = &mut st().d;
+    if let Some(b) = d.bitmaps.get(id) {
+        return Some(b.clone());
+    }
+    let wb = d.wic.CreateBitmapFromHICON(h).ok()?;
+    let conv = d.wic.CreateFormatConverter().ok()?;
+    conv.Initialize(&wb, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)
+        .ok()?;
+    let b = d.rt.CreateBitmapFromWicBitmap(&conv, None).ok()?;
+    d.bitmaps.insert(id.to_string(), b.clone());
+    Some(b)
+}
+
+// ---------- fixados e uso ----------
 
 /// Se o layout do Iniciar mudou, exporta de novo numa thread e avisa a janela no fim.
 fn verificar_fixados() {

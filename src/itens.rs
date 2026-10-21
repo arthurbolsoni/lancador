@@ -11,8 +11,8 @@ use windows::{
         System::{Com::CoTaskMemFree, Environment::ExpandEnvironmentStringsW},
         UI::{
             Shell::{
-                Common::ITEMIDLIST, IShellItemImageFactory, SHCreateItemFromIDList, SHDefExtractIconW, SIIGBF_ICONONLY, SHGetFileInfoW, SHParseDisplayName,
-                SHFILEINFOW, SHGFI_DISPLAYNAME, SHGFI_PIDL,
+                Common::ITEMIDLIST, IShellItemImageFactory, SHCreateItemFromIDList, SHGetFileInfoW,
+                SHParseDisplayName, SHFILEINFOW, SHGFI_DISPLAYNAME, SHGFI_PIDL, SIIGBF_ICONONLY,
             },
             WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO},
         },
@@ -21,14 +21,24 @@ use windows::{
 
 use crate::busca::Chave;
 
+/// Tamanho em que os ícones dos apps são extraídos; o desenho reduz para o tamanho da linha.
+pub const TAM_EXTRACAO: i32 = 64;
+
+pub enum Icone {
+    /// Ícone do próprio app (fixados).
+    Imagem(HICON),
+    /// Glifo da Segoe Fluent Icons (atalhos do sistema): um traço só para a lista toda.
+    Glifo(char),
+    Nenhum,
+}
+
 pub struct Item {
     pub nome: String,
-    pub detalhe: String,
     /// Caminho, URI (`ms-settings:`) ou `shell:AppsFolder\<AUMID>`, passado ao ShellExecute.
     pub arquivo: String,
     pub args: String,
     pub chaves: Vec<Chave>,
-    pub icone: HICON,
+    pub icone: Icone,
 }
 
 impl Item {
@@ -39,66 +49,63 @@ impl Item {
 
 impl Drop for Item {
     fn drop(&mut self) {
-        if !self.icone.is_invalid() {
-            unsafe { DestroyIcon(self.icone).ok() };
+        if let Icone::Imagem(h) = self.icone {
+            unsafe { DestroyIcon(h).ok() };
         }
     }
 }
 
-/// (nome, apelidos separados por vírgula, arquivo, argumentos, ícone)
-/// Ícone vazio = o do próprio arquivo; "arquivo,N" = N-ésimo ícone do arquivo.
-const SISTEMA: &[(&str, &str, &str, &str, &str)] = &[
-    ("Configurações", "settings,config,ajustes", "ms-settings:", "", CONFIG),
-    ("Windows Update", "update,atualizacoes", "ms-settings:windowsupdate", "", CONFIG),
-    ("Aplicativos instalados", "apps,desinstalar,uninstall", "ms-settings:appsfeatures", "", CONFIG),
-    ("Aplicativos de inicialização", "startup,inicializar", "ms-settings:startupapps", "", CONFIG),
-    ("Tela", "display,monitor,resolucao", "ms-settings:display", "", CONFIG),
-    ("Bluetooth e dispositivos", "bluetooth", "ms-settings:bluetooth", "", CONFIG),
-    ("Som (configurações)", "sound,audio", "ms-settings:sound", "", CONFIG),
-    ("Rede e Internet", "network,wifi,rede", "ms-settings:network", "", CONFIG),
-    ("Segurança do Windows", "defender,antivirus", "windowsdefender:", "", r"shell:AppsFolder\Microsoft.SecHealthUI_8wekyb3d8bbwe!SecHealthUI"),
-    ("Editor do Registro", "regedit,registry,registro", "regedit.exe", "", ""),
-    ("Gerenciador de Tarefas", "taskmgr,task manager", "taskmgr.exe", "", ""),
-    ("Painel de Controle", "control panel,control", "control.exe", "", ""),
-    ("Prompt de Comando", "cmd", "cmd.exe", "", ""),
-    ("Windows PowerShell", "powershell", "powershell.exe", "", ""),
-    ("PowerShell 7", "pwsh", "pwsh.exe", "", ""),
-    ("Terminal", "wt,windows terminal", "wt.exe", "", ""),
-    ("Explorador de Arquivos", "explorer", "explorer.exe", "", ""),
-    ("Serviços", "services", "services.msc", "", ""),
-    ("Gerenciador de Dispositivos", "devmgmt,device manager", "devmgmt.msc", "", ""),
-    ("Gerenciamento de Disco", "diskmgmt,disk", "diskmgmt.msc", "", ""),
-    ("Gerenciamento do Computador", "compmgmt", "compmgmt.msc", "", ""),
-    ("Visualizador de Eventos", "eventvwr,event viewer,logs", "eventvwr.msc", "", ""),
-    ("Agendador de Tarefas", "taskschd,task scheduler", "taskschd.msc", "", ""),
-    ("Editor de Política de Grupo", "gpedit,group policy", "gpedit.msc", "", ""),
-    ("Usuários e Grupos Locais", "lusrmgr,users", "lusrmgr.msc", "", ""),
-    ("Firewall com Segurança Avançada", "wf,firewall", "wf.msc", "", ""),
-    ("Monitor de Recursos", "resmon", "resmon.exe", "", ""),
-    ("Monitor de Desempenho", "perfmon", "perfmon.exe", "", ""),
-    ("Configuração do Sistema", "msconfig", "msconfig.exe", "", ""),
-    ("Informações do Sistema", "msinfo32,system information", "msinfo32.exe", "", ""),
-    ("Programas e Recursos", "appwiz", "control.exe", "appwiz.cpl", r"%windir%\System32\appwiz.cpl,0"),
-    ("Conexões de Rede", "ncpa,adaptadores", "control.exe", "ncpa.cpl", r"%windir%\System32\ncpa.cpl,0"),
-    ("Propriedades do Sistema", "sysdm,system properties", "control.exe", "sysdm.cpl", r"%windir%\System32\sysdm.cpl,0"),
-    ("Variáveis de Ambiente", "env,environment,path", "rundll32.exe", "sysdm.cpl,EditEnvironmentVariables", r"%windir%\System32\sysdm.cpl,0"),
-    ("Opções de Energia", "powercfg,energia", "control.exe", "powercfg.cpl", r"%windir%\System32\powercfg.cpl,0"),
-    ("Som", "mmsys,playback,gravacao", "control.exe", "mmsys.cpl", r"%windir%\System32\mmsys.cpl,0"),
-    ("Mouse", "main.cpl", "control.exe", "main.cpl", r"%windir%\System32\main.cpl,0"),
-    ("Data e Hora", "timedate,relogio", "control.exe", "timedate.cpl", r"%windir%\System32\timedate.cpl,0"),
-    ("Opções da Internet", "inetcpl,proxy", "control.exe", "inetcpl.cpl", r"%windir%\System32\inetcpl.cpl,0"),
-    ("Gerenciador de Credenciais", "credential manager,senhas", "control.exe", "/name Microsoft.CredentialManager", r"%windir%\System32\shell32.dll,44"),
-    ("Recursos do Windows", "optionalfeatures,features", "optionalfeatures.exe", "", ""),
-    ("Limpeza de Disco", "cleanmgr", "cleanmgr.exe", "", ""),
-    ("Otimizar Unidades", "dfrgui,desfragmentar", "dfrgui.exe", "", ""),
-    ("Conexão de Área de Trabalho Remota", "mstsc,rdp,remote desktop", "mstsc.exe", "", ""),
-    ("Bloco de Notas", "notepad", "notepad.exe", "", ""),
-    ("Mapa de Caracteres", "charmap", "charmap.exe", "", ""),
-    ("Lixeira", "recycle bin", "shell:RecycleBinFolder", "", ""),
-    ("Bloquear", "lock", "rundll32.exe", "user32.dll,LockWorkStation", r"%windir%\System32\imageres.dll,54"),
+/// (nome, apelidos separados por vírgula, arquivo, argumentos, glifo da Segoe Fluent Icons)
+const SISTEMA: &[(&str, &str, &str, &str, char)] = &[
+    ("Configurações", "settings,config,ajustes", "ms-settings:", "", '\u{E713}'),
+    ("Windows Update", "update,atualizacoes", "ms-settings:windowsupdate", "", '\u{E895}'),
+    ("Aplicativos instalados", "apps,desinstalar,uninstall", "ms-settings:appsfeatures", "", '\u{E71D}'),
+    ("Aplicativos de inicialização", "startup,inicializar", "ms-settings:startupapps", "", '\u{E768}'),
+    ("Tela", "display,monitor,resolucao", "ms-settings:display", "", '\u{E7F4}'),
+    ("Bluetooth e dispositivos", "bluetooth", "ms-settings:bluetooth", "", '\u{E702}'),
+    ("Som (configurações)", "sound,audio", "ms-settings:sound", "", '\u{E767}'),
+    ("Rede e Internet", "network,wifi,rede", "ms-settings:network", "", '\u{E774}'),
+    ("Segurança do Windows", "defender,antivirus", "windowsdefender:", "", '\u{EA18}'),
+    ("Editor do Registro", "regedit,registry,registro", "regedit.exe", "", '\u{EC7A}'),
+    ("Gerenciador de Tarefas", "taskmgr,task manager", "taskmgr.exe", "", '\u{E9D9}'),
+    ("Painel de Controle", "control panel,control", "control.exe", "", '\u{E770}'),
+    ("Prompt de Comando", "cmd", "cmd.exe", "", '\u{E756}'),
+    ("Windows PowerShell", "powershell", "powershell.exe", "", '\u{E756}'),
+    ("PowerShell 7", "pwsh", "pwsh.exe", "", '\u{E756}'),
+    ("Terminal", "wt,windows terminal", "wt.exe", "", '\u{E756}'),
+    ("Explorador de Arquivos", "explorer", "explorer.exe", "", '\u{E8B7}'),
+    ("Serviços", "services", "services.msc", "", '\u{E912}'),
+    ("Gerenciador de Dispositivos", "devmgmt,device manager", "devmgmt.msc", "", '\u{E950}'),
+    ("Gerenciamento de Disco", "diskmgmt,disk", "diskmgmt.msc", "", '\u{EDA2}'),
+    ("Gerenciamento do Computador", "compmgmt", "compmgmt.msc", "", '\u{E7F8}'),
+    ("Visualizador de Eventos", "eventvwr,event viewer,logs", "eventvwr.msc", "", '\u{E81C}'),
+    ("Agendador de Tarefas", "taskschd,task scheduler", "taskschd.msc", "", '\u{E787}'),
+    ("Editor de Política de Grupo", "gpedit,group policy", "gpedit.msc", "", '\u{E7EF}'),
+    ("Usuários e Grupos Locais", "lusrmgr,users", "lusrmgr.msc", "", '\u{E716}'),
+    ("Firewall com Segurança Avançada", "wf,firewall", "wf.msc", "", '\u{EA18}'),
+    ("Monitor de Recursos", "resmon", "resmon.exe", "", '\u{E9F5}'),
+    ("Monitor de Desempenho", "perfmon", "perfmon.exe", "", '\u{E9D2}'),
+    ("Configuração do Sistema", "msconfig", "msconfig.exe", "", '\u{E90F}'),
+    ("Informações do Sistema", "msinfo32,system information", "msinfo32.exe", "", '\u{E946}'),
+    ("Programas e Recursos", "appwiz", "control.exe", "appwiz.cpl", '\u{ECAA}'),
+    ("Conexões de Rede", "ncpa,adaptadores", "control.exe", "ncpa.cpl", '\u{E839}'),
+    ("Propriedades do Sistema", "sysdm,system properties", "control.exe", "sysdm.cpl", '\u{E770}'),
+    ("Variáveis de Ambiente", "env,environment,path", "rundll32.exe", "sysdm.cpl,EditEnvironmentVariables", '\u{E943}'),
+    ("Opções de Energia", "powercfg,energia", "control.exe", "powercfg.cpl", '\u{E7E8}'),
+    ("Som", "mmsys,playback,gravacao", "control.exe", "mmsys.cpl", '\u{E767}'),
+    ("Mouse", "main.cpl", "control.exe", "main.cpl", '\u{E962}'),
+    ("Data e Hora", "timedate,relogio", "control.exe", "timedate.cpl", '\u{E823}'),
+    ("Opções da Internet", "inetcpl,proxy", "control.exe", "inetcpl.cpl", '\u{E774}'),
+    ("Gerenciador de Credenciais", "credential manager,senhas", "control.exe", "/name Microsoft.CredentialManager", '\u{E8D7}'),
+    ("Recursos do Windows", "optionalfeatures,features", "optionalfeatures.exe", "", '\u{EA86}'),
+    ("Limpeza de Disco", "cleanmgr", "cleanmgr.exe", "", '\u{E74D}'),
+    ("Otimizar Unidades", "dfrgui,desfragmentar", "dfrgui.exe", "", '\u{EDA2}'),
+    ("Conexão de Área de Trabalho Remota", "mstsc,rdp,remote desktop", "mstsc.exe", "", '\u{E703}'),
+    ("Bloco de Notas", "notepad", "notepad.exe", "", '\u{E70F}'),
+    ("Mapa de Caracteres", "charmap", "charmap.exe", "", '\u{E8D2}'),
+    ("Lixeira", "recycle bin", "shell:RecycleBinFolder", "", '\u{E74D}'),
+    ("Bloquear", "lock", "rundll32.exe", "user32.dll,LockWorkStation", '\u{E72E}'),
 ];
-
-const CONFIG: &str = r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
 
 pub fn dir_dados() -> PathBuf {
     let d = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("lancador");
@@ -141,7 +148,7 @@ pub fn exportar_fixados() -> bool {
     ok && fs::rename(&tmp, cache_fixados()).is_ok()
 }
 
-pub fn carregar_fixados(tam: i32) -> Vec<Item> {
+pub fn carregar_fixados() -> Vec<Item> {
     let Ok(texto) = fs::read_to_string(cache_fixados()) else { return Vec::new() };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(texto.trim_start_matches('\u{feff}')) else {
         return Vec::new();
@@ -157,45 +164,35 @@ pub fn carregar_fixados(tam: i32) -> Vec<Item> {
             } else {
                 return None;
             };
-            let (nome, icone) = info_shell(&arquivo, tam)?;
+            let (nome, icone) = info_shell(&arquivo, TAM_EXTRACAO)?;
             Some(Item {
                 chaves: vec![Chave::new(&nome)],
                 nome,
-                detalhe: "Fixado no Iniciar".into(),
                 arquivo,
                 args: String::new(),
-                icone,
+                icone: icone.map_or(Icone::Nenhum, Icone::Imagem),
             })
         })
         .collect()
 }
 
-pub fn carregar_sistema(tam: i32) -> Vec<Item> {
+pub fn carregar_sistema() -> Vec<Item> {
     SISTEMA
         .iter()
-        .filter_map(|&(nome, apelidos, arquivo, args, icone)| {
+        .filter_map(|&(nome, apelidos, arquivo, args, glifo)| {
             let caminho = if arquivo.ends_with(".exe") || arquivo.ends_with(".msc") {
                 achar(arquivo)?
             } else {
                 arquivo.to_string()
             };
-            let icone = if icone.is_empty() {
-                info_shell(&caminho, tam).map(|(_, i)| i)
-            } else if let Some((f, n)) = icone.rsplit_once(',').filter(|(_, n)| n.parse::<i32>().is_ok()) {
-                icone_de_arquivo(&expandir(f), n.parse().unwrap(), tam)
-            } else {
-                info_shell(icone, tam).map(|(_, i)| i)
-            };
             let mut chaves = vec![Chave::new(nome)];
             chaves.extend(apelidos.split(',').map(Chave::new));
-            let detalhe = if args.is_empty() { arquivo.to_string() } else { format!("{arquivo} {args}") };
             Some(Item {
                 nome: nome.into(),
-                detalhe,
                 arquivo: caminho,
                 args: args.into(),
                 chaves,
-                icone: icone.unwrap_or_default(),
+                icone: Icone::Glifo(glifo),
             })
         })
         .collect()
@@ -224,7 +221,7 @@ fn expandir(s: &str) -> String {
 /// Nome de exibição e ícone pelo shell (serve para .lnk, arquivo e shell:AppsFolder\...).
 /// O ícone vem do IShellItemImageFactory: sai no tamanho pedido e sem a seta de atalho
 /// que o SHGetFileInfo põe nos .lnk.
-fn info_shell(caminho: &str, tam: i32) -> Option<(String, HICON)> {
+fn info_shell(caminho: &str, tam: i32) -> Option<(String, Option<HICON>)> {
     unsafe {
         let w = HSTRING::from(caminho);
         let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
@@ -246,11 +243,11 @@ fn info_shell(caminho: &str, tam: i32) -> Option<(String, HICON)> {
             return None;
         }
         let len = fi.szDisplayName.iter().position(|&c| c == 0).unwrap_or(fi.szDisplayName.len());
-        Some((String::from_utf16_lossy(&fi.szDisplayName[..len]), icone.unwrap_or_default()))
+        Some((String::from_utf16_lossy(&fi.szDisplayName[..len]), icone))
     }
 }
 
-/// HBITMAP 32 bpp com alfa → HICON (o DrawIconEx respeita o alfa da cor).
+/// HBITMAP 32 bpp com alfa → HICON (o WIC lê o alfa do HICON).
 unsafe fn bitmap_para_icone(cor: HBITMAP, tam: i32) -> Option<HICON> {
     let mascara = CreateBitmap(tam, tam, 1, 1, None);
     let ii = ICONINFO { fIcon: true.into(), hbmMask: mascara, hbmColor: cor, ..Default::default() };
@@ -258,11 +255,4 @@ unsafe fn bitmap_para_icone(cor: HBITMAP, tam: i32) -> Option<HICON> {
     let _ = DeleteObject(mascara.into());
     let _ = DeleteObject(cor.into());
     icone
-}
-
-fn icone_de_arquivo(arquivo: &str, indice: i32, tam: i32) -> Option<HICON> {
-    let w = HSTRING::from(arquivo);
-    let mut h = HICON::default();
-    unsafe { SHDefExtractIconW(&w, indice, 0, Some(&mut h), None, tam as u32 | (16 << 16)) }.ok().ok()?;
-    Some(h)
 }
