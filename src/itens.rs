@@ -24,6 +24,7 @@ use windows::{
 use crate::busca::Chave;
 
 /// Tamanho em que os ícones dos apps são extraídos; o desenho reduz para o tamanho da linha.
+/// Acima de 48 o shell passa a usar (e guardar no processo) a lista jumbo de 256 px.
 pub const TAM_EXTRACAO: i32 = 48;
 
 pub enum Icone {
@@ -262,9 +263,6 @@ pub fn item_de_app(nome: String, id: &str) -> Item {
 
 /// Extrai agora o ícone de um item pendente.
 pub fn carregar_icone(arquivo: &str) -> Icone {
-    if std::env::var_os("LANCADOR_TESTE_SEM_ICONE").is_some() {
-        return Icone::Nenhum;
-    }
     match info_shell(arquivo, TAM_EXTRACAO) {
         Some((_, Some(h))) => Icone::Imagem(h),
         _ => Icone::Nenhum,
