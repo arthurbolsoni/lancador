@@ -25,7 +25,7 @@ use windows::{
             Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED},
             DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
             LibraryLoader::GetModuleHandleW,
-            Memory::{GlobalLock, GlobalUnlock},
+            Memory::{GetProcessHeap, GlobalLock, GlobalUnlock, HeapCompact, HEAP_FLAGS},
             Threading::CreateMutexW,
         },
         UI::{
@@ -627,6 +627,19 @@ unsafe fn esconder() {
     s.cursor = 0;
     s.tudo_marcado = false;
     atualizar_busca();
+    descartar_icones();
+}
+
+/// Fechado, só os bitmaps dos fixados ficam (a próxima abertura mostra eles na hora).
+/// Os outros são refeitos quando o app aparecer de novo numa busca.
+unsafe fn descartar_icones() {
+    let s = st();
+    let manter: std::collections::HashSet<String> = s.fixados.iter().map(Item::id).collect();
+    s.d.bitmaps.retain(|id, _| manter.contains(id));
+    s.d.bitmaps.shrink_to_fit();
+    if let Ok(heap) = GetProcessHeap() {
+        HeapCompact(heap, HEAP_FLAGS(0));
+    }
 }
 
 unsafe fn abrir(admin: bool) {
@@ -919,6 +932,8 @@ unsafe fn bitmap_do_item(it: &mut Item) -> Option<ID2D1Bitmap> {
         .ok()?;
     let b = d.rt.CreateBitmapFromWicBitmap(&conv, None).ok()?;
     d.bitmaps.insert(id, b.clone());
+    // O bitmap já tem os pixels; o HICON só ocuparia memória em dobro.
+    it.soltar_icone();
     Some(b)
 }
 

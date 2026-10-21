@@ -24,7 +24,7 @@ use windows::{
 use crate::busca::Chave;
 
 /// Tamanho em que os ícones dos apps são extraídos; o desenho reduz para o tamanho da linha.
-pub const TAM_EXTRACAO: i32 = 64;
+pub const TAM_EXTRACAO: i32 = 48;
 
 pub enum Icone {
     /// Ícone do próprio app (fixados).
@@ -262,6 +262,9 @@ pub fn item_de_app(nome: String, id: &str) -> Item {
 
 /// Extrai agora o ícone de um item pendente.
 pub fn carregar_icone(arquivo: &str) -> Icone {
+    if std::env::var_os("LANCADOR_TESTE_SEM_ICONE").is_some() {
+        return Icone::Nenhum;
+    }
     match info_shell(arquivo, TAM_EXTRACAO) {
         Some((_, Some(h))) => Icone::Imagem(h),
         _ => Icone::Nenhum,
@@ -325,4 +328,14 @@ unsafe fn bitmap_para_icone(cor: HBITMAP, tam: i32) -> Option<HICON> {
     let _ = DeleteObject(mascara.into());
     let _ = DeleteObject(cor.into());
     icone
+}
+
+impl Item {
+    /// Libera o HICON; o ícone volta a ser extraído do arquivo quando for preciso de novo.
+    pub fn soltar_icone(&mut self) {
+        if let Icone::Imagem(h) = self.icone {
+            unsafe { DestroyIcon(h).ok() };
+            self.icone = Icone::Pendente;
+        }
+    }
 }
