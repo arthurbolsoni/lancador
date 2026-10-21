@@ -3,7 +3,7 @@
 Lançador mínimo para Windows, no lugar do Flow Launcher. Alt+Space abre; Esc ou perder o foco fecha e limpa o campo.
 
 - Campo vazio: os apps fixados no Iniciar, na ordem do Iniciar.
-- Busca: fixados + atalhos do sistema (Configurações, regedit, services.msc, Painel de Controle etc., lista em `src/itens.rs`). Sem acento e sem caixa; prefixo > início de palavra > sigla > substring > subsequência. Apps mais abertos ganham peso.
+- Busca: fixados + todos os apps do Iniciar (`shell:AppsFolder`, relido numa thread ao abrir, no máximo 1x por minuto; ícone extraído só quando o app aparece) + atalhos do sistema (Configurações, regedit, services.msc, Painel de Controle etc., lista em `src/itens.rs`). Desinstaladores, links de site e documentos ficam fora. Se há casamento real, os de letras soltas somem. Sem acento e sem caixa; prefixo > início de palavra > sigla > substring > subsequência. Apps mais abertos ganham peso.
 - Teclas: ↑/↓/Tab, PgUp/PgDn, Enter abre, Ctrl+Shift+Enter abre como administrador; no campo, ←/→ (Ctrl = palavra), Home/End, Ctrl+Backspace, Ctrl+A, Ctrl+V.
 
 ## Visual

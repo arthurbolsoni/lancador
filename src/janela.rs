@@ -45,6 +45,14 @@ use crate::{
 
 const CLASSE: PCWSTR = w!("LancadorRs");
 const WM_FIXADOS: u32 = WM_APP + 1;
+const WM_APPS: u32 = WM_APP + 3;
+/// Releitura de "Todos os aplicativos" no máximo uma vez por este intervalo, ao abrir.
+const INTERVALO_APPS: std::time::Duration = std::time::Duration::from_secs(60);
+
+// Origem de um resultado; o maior ganha no empate de pontuação.
+const SISTEMA: u8 = 0;
+const APP: u8 = 1;
+const FIXADO: u8 = 2;
 const WM_MOSTRAR: u32 = WM_APP + 2;
 const TIMER_ANIM: usize = 1;
 const TIMER_CARET: usize = 2;
@@ -98,9 +106,12 @@ struct Estado {
     hwnd: HWND,
     d: Desenho,
     fixados: Vec<Item>,
+    apps: Vec<Item>,
+    apps_lidos: Option<Instant>,
+    listando: bool,
     sistema: Vec<Item>,
-    /// (é fixado, índice na lista)
-    resultados: Vec<(bool, usize)>,
+    /// (origem, índice na lista da origem)
+    resultados: Vec<(u8, usize)>,
     sel: usize,
     topo: usize,
     texto: Vec<char>,
@@ -187,6 +198,9 @@ pub fn rodar() {
             hwnd,
             d: criar_desenho().expect("Direct2D"),
             fixados: itens::carregar_fixados(),
+            apps: Vec::new(),
+            apps_lidos: None,
+            listando: false,
             sistema: itens::carregar_sistema(),
             resultados: Vec::new(),
             sel: 0,
@@ -207,6 +221,7 @@ pub fn rodar() {
         }));
         atualizar_busca();
         verificar_fixados();
+        verificar_apps();
 
         if RegisterHotKey(Some(hwnd), 1, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32).is_err() {
             MessageBoxW(None, w!("Alt+Space já está em uso por outro programa."), w!("Lançador"), MB_ICONERROR);
@@ -295,6 +310,7 @@ unsafe extern "system" fn proc_janela(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             st().fixados = itens::carregar_fixados();
             atualizar_busca();
         }
+        WM_APPS => receber_apps(lp),
         WM_ACTIVATE => {
             if (wp.0 & 0xffff) as u32 == WA_INACTIVE {
                 esconder();
@@ -473,12 +489,12 @@ unsafe fn area_de_transferencia() -> String {
 
 // ---------- resultados ----------
 
-fn item(r: (bool, usize)) -> &'static Item {
+fn item(r: (u8, usize)) -> &'static mut Item {
     let s = st();
-    if r.0 {
-        &s.fixados[r.1]
-    } else {
-        &s.sistema[r.1]
+    match r.0 {
+        FIXADO => &mut s.fixados[r.1],
+        APP => &mut s.apps[r.1],
+        _ => &mut s.sistema[r.1],
     }
 }
 
@@ -486,15 +502,15 @@ unsafe fn atualizar_busca() {
     let s = st();
     let consulta = busca::dobrar(s.texto.iter().collect::<String>().trim());
     s.resultados = if consulta.is_empty() {
-        (0..s.fixados.len()).map(|i| (true, i)).collect()
+        (0..s.fixados.len()).map(|i| (FIXADO, i)).collect()
     } else {
-        let mut v: Vec<(u32, bool, usize)> = Vec::new();
-        for (fixado, lista) in [(true, &s.fixados), (false, &s.sistema)] {
+        let mut v: Vec<(u32, u8, usize)> = Vec::new();
+        for (origem, lista) in [(FIXADO, &s.fixados), (APP, &s.apps), (SISTEMA, &s.sistema)] {
             for (i, it) in lista.iter().enumerate() {
                 let p = it.chaves.iter().map(|k| busca::pontuar(&consulta, k)).max().unwrap_or(0);
                 if p > 0 {
                     let bonus = s.uso.get(&it.id()).map_or(0, |n| (n * 15).min(150));
-                    v.push((p + bonus, fixado, i));
+                    v.push((p + bonus, origem, i));
                 }
             }
         }
@@ -503,6 +519,10 @@ unsafe fn atualizar_busca() {
                 .then(b.1.cmp(&a.1))
                 .then(item((a.1, a.2)).nome.len().cmp(&item((b.1, b.2)).nome.len()))
         });
+        // Com algum casamento de verdade (>= sigla solta), letras soltas pelo nome viram ruído.
+        if v.iter().any(|r| r.0 >= 500) {
+            v.retain(|r| r.0 >= 500);
+        }
         let mut vistos = std::collections::HashSet::new();
         v.into_iter()
             .filter(|r| vistos.insert(busca::dobrar(&item((r.1, r.2)).nome)))
@@ -563,6 +583,7 @@ unsafe fn mover(d: i32) {
 
 unsafe fn mostrar() {
     verificar_fixados();
+    verificar_apps();
     let s = st();
     let mut p = POINT::default();
     let _ = GetCursorPos(&mut p);
@@ -859,18 +880,12 @@ unsafe fn desenhar(altura: f32) {
         let it = item(r);
         let y = y0 + vi as f32 * ALT_ITEM;
         let caixa = ret(X_ICONE, y + (ALT_ITEM - TAM_ICONE) / 2.0, X_ICONE + TAM_ICONE, y + (ALT_ITEM + TAM_ICONE) / 2.0);
-        match it.icone {
-            Icone::Imagem(h) => {
-                if let Some(b) = bitmap_do_icone(&it.id(), h) {
-                    rt.DrawBitmap(&b, Some(&caixa), alfa, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-                }
-            }
-            Icone::Glifo(g) => {
-                let mut buf = [0u16; 2];
-                pinta(com_alfa(COR_GLIFO, alfa));
-                rt.DrawText(g.encode_utf16(&mut buf), &d.fmt_glifo, &caixa, p, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
-            }
-            Icone::Nenhum => {}
+        if let Icone::Glifo(g) = it.icone {
+            let mut buf = [0u16; 2];
+            pinta(com_alfa(COR_GLIFO, alfa));
+            rt.DrawText(g.encode_utf16(&mut buf), &d.fmt_glifo, &caixa, p, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        } else if let Some(b) = bitmap_do_item(it) {
+            rt.DrawBitmap(&b, Some(&caixa), alfa, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
         }
         let nome: Vec<u16> = it.nome.encode_utf16().collect();
         pinta(com_alfa(if s.topo + vi == s.sel { COR_TEXTO } else { COR_NOME }, alfa));
@@ -886,19 +901,50 @@ unsafe fn desenhar(altura: f32) {
     rt.PopAxisAlignedClip();
 }
 
-/// HICON → bitmap do Direct2D (PBGRA), guardado por item.
-unsafe fn bitmap_do_icone(id: &str, h: HICON) -> Option<ID2D1Bitmap> {
+/// Bitmap do Direct2D (PBGRA) do ícone do item, guardado por ID. Ícone pendente é extraído
+/// aqui, na primeira vez que o item aparece.
+unsafe fn bitmap_do_item(it: &mut Item) -> Option<ID2D1Bitmap> {
+    let id = it.id();
     let d = &mut st().d;
-    if let Some(b) = d.bitmaps.get(id) {
+    if let Some(b) = d.bitmaps.get(&id) {
         return Some(b.clone());
     }
+    if matches!(it.icone, Icone::Pendente) {
+        it.icone = itens::carregar_icone(&it.arquivo);
+    }
+    let Icone::Imagem(h) = it.icone else { return None };
     let wb = d.wic.CreateBitmapFromHICON(h).ok()?;
     let conv = d.wic.CreateFormatConverter().ok()?;
     conv.Initialize(&wb, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)
         .ok()?;
     let b = d.rt.CreateBitmapFromWicBitmap(&conv, None).ok()?;
-    d.bitmaps.insert(id.to_string(), b.clone());
+    d.bitmaps.insert(id, b.clone());
     Some(b)
+}
+
+/// Relê "Todos os aplicativos" numa thread se a última leitura passou do intervalo.
+fn verificar_apps() {
+    let s = st();
+    if s.listando || s.apps_lidos.is_some_and(|t| t.elapsed() < INTERVALO_APPS) {
+        return;
+    }
+    s.listando = true;
+    let h = s.hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let apps = Box::new(itens::listar_apps());
+        let _ = PostMessageW(Some(HWND(h as _)), WM_APPS, WPARAM(0), LPARAM(Box::into_raw(apps) as isize));
+    });
+}
+
+/// Troca a lista de apps pela lida na thread. Os bitmaps já feitos continuam no cache por ID.
+unsafe fn receber_apps(lp: LPARAM) {
+    let apps = Box::from_raw(lp.0 as *mut Vec<(String, String)>);
+    let s = st();
+    s.listando = false;
+    s.apps_lidos = Some(Instant::now());
+    s.apps = apps.into_iter().map(|(nome, id)| itens::item_de_app(nome, &id)).collect();
+    atualizar_busca();
 }
 
 // ---------- fixados e uso ----------

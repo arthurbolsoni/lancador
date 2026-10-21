@@ -11,8 +11,10 @@ use windows::{
         System::{Com::CoTaskMemFree, Environment::ExpandEnvironmentStringsW},
         UI::{
             Shell::{
-                Common::ITEMIDLIST, IShellItemImageFactory, SHCreateItemFromIDList, SHGetFileInfoW,
-                SHParseDisplayName, SHFILEINFOW, SHGFI_DISPLAYNAME, SHGFI_PIDL, SIIGBF_ICONONLY,
+                Common::ITEMIDLIST, BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem,
+                IShellItemImageFactory, SHCreateItemFromIDList, SHGetFileInfoW, SHGetKnownFolderItem,
+                SHParseDisplayName, KF_FLAG_DEFAULT, SHFILEINFOW, SHGFI_DISPLAYNAME, SHGFI_PIDL, SIGDN,
+                SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIIGBF_ICONONLY,
             },
             WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO},
         },
@@ -27,6 +29,8 @@ pub const TAM_EXTRACAO: i32 = 64;
 pub enum Icone {
     /// Ícone do próprio app (fixados).
     Imagem(HICON),
+    /// App de "Todos os aplicativos": o ícone só é extraído quando o item aparece na tela.
+    Pendente,
     /// Glifo da Segoe Fluent Icons (atalhos do sistema): um traço só para a lista toda.
     Glifo(char),
     Nenhum,
@@ -196,6 +200,72 @@ pub fn carregar_sistema() -> Vec<Item> {
             })
         })
         .collect()
+}
+
+/// "Todos os aplicativos" do Iniciar (`shell:AppsFolder`): apps clássicos e da Store numa
+/// lista só, já sem o que o próprio Iniciar esconde. Devolve (nome, ID de abertura).
+/// Roda fora da thread da janela (~centenas de ms).
+pub fn listar_apps() -> Vec<(String, String)> {
+    let mut apps = Vec::new();
+    unsafe {
+        let Ok(pasta) = SHGetKnownFolderItem::<IShellItem>(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None) else {
+            return apps;
+        };
+        let Ok(lista) = pasta.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) else { return apps };
+        loop {
+            let mut um = [None];
+            let mut n = 0;
+            if lista.Next(&mut um, Some(&mut n)).is_err() || n == 0 {
+                break;
+            }
+            let Some(it) = um[0].take() else { break };
+            let (Some(nome), Some(id)) = (nome_shell(&it, SIGDN_NORMALDISPLAY), nome_shell(&it, SIGDN_PARENTRELATIVEPARSING))
+            else {
+                continue;
+            };
+            if app_util(&nome, &id) {
+                apps.push((nome, id));
+            }
+        }
+    }
+    apps
+}
+
+unsafe fn nome_shell(it: &IShellItem, tipo: SIGDN) -> Option<String> {
+    let p = it.GetDisplayName(tipo).ok()?;
+    let s = p.to_string().ok();
+    CoTaskMemFree(Some(p.0 as *const _));
+    s
+}
+
+/// Fora: desinstaladores, links de site e documentos que os instaladores põem no Iniciar.
+fn app_util(nome: &str, id: &str) -> bool {
+    let nome = crate::busca::dobrar(nome);
+    let id = id.to_lowercase();
+    !(nome.contains("uninstall")
+        || nome.contains("desinstal")
+        || id.starts_with("http:")
+        || id.starts_with("https:")
+        || [".url", ".chm", ".txt", ".pdf", ".htm", ".html", ".rtf"].iter().any(|e| id.ends_with(e)))
+}
+
+pub fn item_de_app(nome: String, id: &str) -> Item {
+    let mut chaves = vec![Chave::new(&nome)];
+    // Nome do exe também casa ("qbittorrent" acha "qBittorrent", "wt" acha o Terminal pelo exe).
+    if let Some(exe) = id.rsplit(['\\', '/']).next().and_then(|f| f.strip_suffix(".exe").or(f.strip_suffix(".EXE"))) {
+        if crate::busca::dobrar(exe) != crate::busca::dobrar(&nome) {
+            chaves.push(Chave::new(exe));
+        }
+    }
+    Item { nome, arquivo: format!(r"shell:AppsFolder\{id}"), args: String::new(), chaves, icone: Icone::Pendente }
+}
+
+/// Extrai agora o ícone de um item pendente.
+pub fn carregar_icone(arquivo: &str) -> Icone {
+    match info_shell(arquivo, TAM_EXTRACAO) {
+        Some((_, Some(h))) => Icone::Imagem(h),
+        _ => Icone::Nenhum,
+    }
 }
 
 /// Procura um exe/msc no System32, no Windows e no PATH.
