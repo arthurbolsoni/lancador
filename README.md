@@ -12,7 +12,7 @@ Fundo acrílico do DWM (`DWMSBT_TRANSIENTWINDOW`) com véu na cor de fundo do te
 
 ## Tema
 
-Segue o tema da barra: a lista de `src/tema.rs` é cópia de `barra/src/tema.rs`, na mesma ordem, e o índice escolhido vem de `HKCU\Softwarearra\Tema` (sem a chave, o primeiro). É relido a cada Alt+Space. Tema claro usa acrílico claro. Tema novo na barra precisa ser copiado para cá, na mesma posição.
+Segue o tema da barra: a lista de `src/tema.rs` é cópia de `barra/src/tema.rs`, na mesma ordem, e o índice escolhido vem de `HKCU\Software\barra\Tema` (sem a chave, o primeiro). É relido a cada Alt+Space. Tema claro usa acrílico claro. Tema novo na barra precisa ser copiado para cá, na mesma posição.
 
 ## Fixados
 
