@@ -108,7 +108,8 @@ const SISTEMA: &[(&str, &str, &str, &str, char)] = &[
     ("Conexão de Área de Trabalho Remota", "mstsc,rdp,remote desktop", "mstsc.exe", "", '\u{E703}'),
     ("Bloco de Notas", "notepad", "notepad.exe", "", '\u{E70F}'),
     ("Mapa de Caracteres", "charmap", "charmap.exe", "", '\u{E8D2}'),
-    ("Lixeira", "recycle bin", "shell:RecycleBinFolder", "", '\u{E74D}'),
+    ("WhatsApp", "whats,wpp,zap", "msedge.exe", "--app=https://web.whatsapp.com", '\u{E8BD}'),
+    ("Lixeira","recycle bin", "shell:RecycleBinFolder", "", '\u{E74D}'),
     ("Bloquear", "lock", "rundll32.exe", "user32.dll,LockWorkStation", '\u{E72E}'),
 ];
 
