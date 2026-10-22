@@ -109,7 +109,7 @@ const SISTEMA: &[(&str, &str, &str, &str, char)] = &[
     ("Bloco de Notas", "notepad", "notepad.exe", "", '\u{E70F}'),
     ("Mapa de Caracteres", "charmap", "charmap.exe", "", '\u{E8D2}'),
     ("WhatsApp", "whats,wpp,zap", "msedge.exe", "--app=https://web.whatsapp.com", '\u{E8BD}'),
-    ("Lixeira","recycle bin", "shell:RecycleBinFolder", "", '\u{E74D}'),
+    ("Lixeira", "recycle bin", "shell:RecycleBinFolder", "", '\u{E74D}'),
     ("Bloquear", "lock", "rundll32.exe", "user32.dll,LockWorkStation", '\u{E72E}'),
 ];
 
