@@ -41,6 +41,7 @@ use windows::{
 use crate::{
     busca,
     itens::{self, Icone, Item},
+    tema::{self, Tema},
 };
 
 const CLASSE: PCWSTR = w!("LancadorRs");
@@ -77,15 +78,44 @@ const DUR_ABERTURA: f32 = 0.16;
 const fn cor(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a }
 }
-/// Véu sobre o acrílico: garante contraste em papel de parede claro.
-const COR_VEU: D2D1_COLOR_F = cor(22, 22, 24, 0.66);
-const COR_TEXTO: D2D1_COLOR_F = cor(255, 255, 255, 0.94);
-const COR_DICA: D2D1_COLOR_F = cor(255, 255, 255, 0.46);
-const COR_NOME: D2D1_COLOR_F = cor(255, 255, 255, 0.86);
-const COR_GLIFO: D2D1_COLOR_F = cor(255, 255, 255, 0.80);
-const COR_SELECAO: D2D1_COLOR_F = cor(255, 255, 255, 0.085);
-const COR_LINHA: D2D1_COLOR_F = cor(255, 255, 255, 0.07);
-const COR_MARCA_TEXTO: D2D1_COLOR_F = cor(96, 205, 255, 0.38);
+fn hex(h: u32, a: f32) -> D2D1_COLOR_F {
+    cor((h >> 16) as u8, (h >> 8) as u8, h as u8, a)
+}
+
+/// `a` levado `f` (0..1) na direção de `b`, como na barra.
+fn mistura(a: u32, b: u32, f: f32) -> u32 {
+    let canal = |s: u32| {
+        let (x, y) = (((a >> s) & 0xFF) as f32, ((b >> s) & 0xFF) as f32);
+        ((x + (y - x) * f).round() as u32) << s
+    };
+    canal(16) | canal(8) | canal(0)
+}
+
+/// Cores do lançador derivadas do tema da barra.
+struct Cores {
+    /// Véu sobre o acrílico: o fundo do tema, com um pouco do acrílico passando.
+    veu: D2D1_COLOR_F,
+    texto: D2D1_COLOR_F,
+    dica: D2D1_COLOR_F,
+    nome: D2D1_COLOR_F,
+    selecao: D2D1_COLOR_F,
+    linha: D2D1_COLOR_F,
+    marca_texto: D2D1_COLOR_F,
+    destaque: D2D1_COLOR_F,
+}
+
+fn cores(t: &Tema) -> Cores {
+    Cores {
+        veu: hex(t.fundo, 0.84),
+        texto: hex(t.texto_forte, 1.0),
+        dica: hex(mistura(t.texto, t.fundo, 0.45), 1.0),
+        nome: hex(t.texto, 1.0),
+        selecao: hex(t.selecao, 1.0),
+        linha: hex(t.selecao, 1.0),
+        marca_texto: hex(t.destaque, 0.38),
+        destaque: hex(t.destaque, 1.0),
+    }
+}
 
 struct Desenho {
     dw: IDWriteFactory,
@@ -119,6 +149,8 @@ struct Estado {
     tudo_marcado: bool,
     caret_aceso: bool,
     uso: HashMap<String, u32>,
+    tema: &'static Tema,
+    cores: Cores,
     escala: f32,
     exportando: bool,
     mouse: (i32, i32),
@@ -180,20 +212,18 @@ pub fn rodar() {
         )
         .unwrap();
 
-        let sim: i32 = 1;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &sim as *const _ as _, 4);
         let fundo = DWMSBT_TRANSIENTWINDOW;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &fundo as *const _ as _, 4);
         let canto = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &canto as *const _ as _, 4);
-        let borda = COLORREF(0x003c3c3c);
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borda as *const _ as _, 4);
         let _ = DwmExtendFrameIntoClientArea(
             hwnd,
             &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 },
         );
 
         let escala = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        let t = tema::escolhido();
+        aplicar_tema_dwm(hwnd, t);
         ESTADO = Box::into_raw(Box::new(Estado {
             hwnd,
             d: criar_desenho().expect("Direct2D"),
@@ -210,6 +240,8 @@ pub fn rodar() {
             tudo_marcado: false,
             caret_aceso: true,
             uso: carregar_uso(),
+            tema: t,
+            cores: cores(t),
             escala,
             exportando: false,
             mouse: (-1, -1),
@@ -236,12 +268,33 @@ pub fn rodar() {
     }
 }
 
+/// Acrílico claro ou escuro conforme o tema; borda na cor apagada do tema.
+unsafe fn aplicar_tema_dwm(hwnd: HWND, t: &Tema) {
+    let escuro: i32 = (!t.claro).into();
+    let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &escuro as *const _ as _, 4);
+    // COLORREF é 0x00BBGGRR.
+    let m = t.mudo;
+    let borda = COLORREF(((m & 0xFF) << 16) | (m & 0xFF00) | ((m >> 16) & 0xFF));
+    let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borda as *const _ as _, 4);
+}
+
+/// Relê o tema da barra; se mudou desde a última abertura, troca cores e acrílico.
+unsafe fn atualizar_tema() {
+    let s = st();
+    let t = tema::escolhido();
+    if t.nome != s.tema.nome {
+        s.tema = t;
+        s.cores = cores(t);
+        aplicar_tema_dwm(s.hwnd, t);
+    }
+}
+
 unsafe fn criar_desenho() -> windows::core::Result<Desenho> {
     let fabrica: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
     let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
     let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
     let rt = criar_alvo(&fabrica)?;
-    let pincel = rt.CreateSolidColorBrush(&COR_TEXTO, None)?;
+    let pincel = rt.CreateSolidColorBrush(&cor(0, 0, 0, 1.0), None)?;
 
     let formato = |familia: PCWSTR, peso: DWRITE_FONT_WEIGHT, tam: f32| -> windows::core::Result<IDWriteTextFormat> {
         let f = dw.CreateTextFormat(familia, None, peso, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, tam, w!("pt-BR"))?;
@@ -582,6 +635,7 @@ unsafe fn mover(d: i32) {
 // ---------- mostrar / esconder / abrir ----------
 
 unsafe fn mostrar() {
+    atualizar_tema();
     verificar_fixados();
     verificar_apps();
     let s = st();
@@ -748,7 +802,7 @@ unsafe fn pintar(hwnd: HWND) {
                 // Alvo perdido: recria; os bitmaps pertencem ao alvo antigo.
                 let s = st();
                 if let Ok(rt) = criar_alvo(&s.d.fabrica) {
-                    if let Ok(p) = rt.CreateSolidColorBrush(&COR_TEXTO, None) {
+                    if let Ok(p) = rt.CreateSolidColorBrush(&cor(0, 0, 0, 1.0), None) {
                         s.d.rt = rt;
                         s.d.pincel = p;
                         s.d.bitmaps.clear();
@@ -811,12 +865,13 @@ fn suavizar(t: f32) -> f32 {
 unsafe fn desenhar(altura: f32) {
     let s = st();
     let d = &s.d;
+    let c = &s.cores;
     let rt = &d.rt;
     let p = &d.pincel;
     let pinta = |c: D2D1_COLOR_F| p.SetColor(&c);
 
     rt.Clear(Some(&cor(0, 0, 0, 0.0)));
-    pinta(COR_VEU);
+    pinta(c.veu);
     rt.FillRectangle(&ret(0.0, 0.0, LARGURA, altura), p);
 
     // Abertura: o conteúdo desce 6 DIPs e aparece.
@@ -828,7 +883,7 @@ unsafe fn desenhar(altura: f32) {
     let texto: Vec<u16> = s.texto.iter().collect::<String>().encode_utf16().collect();
     let largura_campo = LARGURA - X_TEXTO_BUSCA * 2.0;
     if texto.is_empty() {
-        pinta(com_alfa(COR_DICA, alfa));
+        pinta(com_alfa(c.dica, alfa));
         let dica: Vec<u16> = "Pesquisar apps e configurações".encode_utf16().collect();
         rt.DrawText(
             &dica,
@@ -849,14 +904,14 @@ unsafe fn desenhar(altura: f32) {
         if s.tudo_marcado {
             let mut m = DWRITE_TEXT_METRICS::default();
             let _ = layout.GetMetrics(&mut m);
-            pinta(com_alfa(COR_MARCA_TEXTO, alfa));
+            pinta(com_alfa(c.marca_texto, alfa));
             rt.FillRectangle(
                 &ret(X_TEXTO_BUSCA, topo_linha, X_TEXTO_BUSCA + m.widthIncludingTrailingWhitespace, topo_linha + alt_linha),
                 p,
             );
         }
         if !texto.is_empty() {
-            pinta(com_alfa(COR_TEXTO, alfa));
+            pinta(com_alfa(c.texto, alfa));
             rt.DrawText(
                 &texto,
                 &d.fmt_busca,
@@ -867,7 +922,7 @@ unsafe fn desenhar(altura: f32) {
             );
         }
         if s.caret_aceso && !s.tudo_marcado {
-            pinta(com_alfa(COR_TEXTO, alfa));
+            pinta(com_alfa(c.texto, alfa));
             let x = X_TEXTO_BUSCA + cx;
             rt.FillRectangle(&ret(x, topo_linha + 3.0, x + 1.5, topo_linha + alt_linha - 3.0), p);
         }
@@ -877,15 +932,21 @@ unsafe fn desenhar(altura: f32) {
     if n == 0 {
         return;
     }
-    pinta(com_alfa(COR_LINHA, alfa));
+    pinta(com_alfa(c.linha, alfa));
     rt.FillRectangle(&ret(0.0, ALT_BUSCA, LARGURA, ALT_BUSCA + 1.0), p);
 
     rt.PushAxisAlignedClip(&ret(0.0, ALT_BUSCA + 1.0, LARGURA, altura), D2D1_ANTIALIAS_MODE_ALIASED);
     let y0 = TOPO_LISTA + dy;
-    pinta(com_alfa(COR_SELECAO, alfa));
+    pinta(com_alfa(c.selecao, alfa));
     let ys = y0 + s.sel_y;
     rt.FillRoundedRectangle(
         &D2D1_ROUNDED_RECT { rect: ret(8.0, ys + 2.0, LARGURA - 8.0, ys + ALT_ITEM - 2.0), radiusX: 6.0, radiusY: 6.0 },
+        p,
+    );
+    // Marca na cor de destaque do tema, à esquerda da seleção.
+    pinta(com_alfa(c.destaque, alfa));
+    rt.FillRoundedRectangle(
+        &D2D1_ROUNDED_RECT { rect: ret(8.0, ys + 13.0, 11.0, ys + ALT_ITEM - 13.0), radiusX: 1.5, radiusY: 1.5 },
         p,
     );
 
@@ -895,13 +956,13 @@ unsafe fn desenhar(altura: f32) {
         let caixa = ret(X_ICONE, y + (ALT_ITEM - TAM_ICONE) / 2.0, X_ICONE + TAM_ICONE, y + (ALT_ITEM + TAM_ICONE) / 2.0);
         if let Icone::Glifo(g) = it.icone {
             let mut buf = [0u16; 2];
-            pinta(com_alfa(COR_GLIFO, alfa));
+            pinta(com_alfa(c.nome, alfa));
             rt.DrawText(g.encode_utf16(&mut buf), &d.fmt_glifo, &caixa, p, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
         } else if let Some(b) = bitmap_do_item(it) {
             rt.DrawBitmap(&b, Some(&caixa), alfa, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
         }
         let nome: Vec<u16> = it.nome.encode_utf16().collect();
-        pinta(com_alfa(if s.topo + vi == s.sel { COR_TEXTO } else { COR_NOME }, alfa));
+        pinta(com_alfa(if s.topo + vi == s.sel { c.texto } else { c.nome }, alfa));
         rt.DrawText(
             &nome,
             &d.fmt_nome,

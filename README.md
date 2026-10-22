@@ -8,7 +8,11 @@ Lançador mínimo para Windows, no lugar do Flow Launcher. Alt+Space abre; Esc o
 
 ## Visual
 
-Fundo acrílico do DWM (`DWMSBT_TRANSIENTWINDOW`) com véu escuro por cima para garantir contraste. O conteúdo é desenhado em Direct2D/DirectWrite (modo software: o hardware carregava o driver da GPU, +50 MB) num DIB de 32 bits com alfa, copiado para a área cliente com o frame estendido. O campo de busca é próprio porque o EDIT do Win32 pinta fundo opaco. Fixados usam o ícone do app; atalhos do sistema usam glifos da Segoe Fluent Icons. A seleção desliza entre as linhas e a janela cresce/encolhe com easing exponencial.
+Fundo acrílico do DWM (`DWMSBT_TRANSIENTWINDOW`) com véu na cor de fundo do tema por cima. O conteúdo é desenhado em Direct2D/DirectWrite (modo software: o hardware carregava o driver da GPU, +50 MB) num DIB de 32 bits com alfa, copiado para a área cliente com o frame estendido. O campo de busca é próprio porque o EDIT do Win32 pinta fundo opaco. Fixados usam o ícone do app; atalhos do sistema usam glifos da Segoe Fluent Icons. A seleção desliza entre as linhas e a janela cresce/encolhe com easing exponencial.
+
+## Tema
+
+Segue o tema da barra: a lista de `src/tema.rs` é cópia de `barra/src/tema.rs`, na mesma ordem, e o índice escolhido vem de `HKCU\Softwarearra\Tema` (sem a chave, o primeiro). É relido a cada Alt+Space. Tema claro usa acrílico claro. Tema novo na barra precisa ser copiado para cá, na mesma posição.
 
 ## Fixados
 
