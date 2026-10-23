@@ -41,14 +41,13 @@ use windows::{
 use crate::{
     busca,
     itens::{self, Icone, Item},
-    teclado,
     tema::{self, Tema},
 };
 
 const CLASSE: PCWSTR = w!("LancadorRs");
 const WM_FIXADOS: u32 = WM_APP + 1;
 const WM_APPS: u32 = WM_APP + 3;
-/// Win solto sozinho (do gancho de teclado): o mesmo que o Alt+Space.
+/// Win solto sozinho (vem do gancho de teclado da barra): o mesmo que o Alt+Space.
 const WM_WIN: u32 = WM_APP + 4;
 /// Releitura de "Todos os aplicativos" no máximo uma vez por este intervalo, ao abrir.
 const INTERVALO_APPS: std::time::Duration = std::time::Duration::from_secs(60);
@@ -262,7 +261,6 @@ pub fn rodar() {
             MessageBoxW(None, w!("Alt+Space já está em uso por outro programa."), w!("Lançador"), MB_ICONERROR);
             return;
         }
-        teclado::instalar(hwnd, WM_WIN);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
