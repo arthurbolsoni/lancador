@@ -3,6 +3,7 @@
 mod busca;
 mod itens;
 mod janela;
+mod teclado;
 mod tema;
 
 fn main() {
