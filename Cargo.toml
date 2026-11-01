@@ -2,12 +2,12 @@
 name = "lancador"
 version = "0.1.0"
 edition = "2021"
-description = "Lançador mínimo para Windows (Alt+Space): fixados do Iniciar e atalhos do sistema"
+description = "Lançador mínimo (Alt+Space) para Windows e KDE Plasma (Wayland)"
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 serde_json = "1"
 
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.61"
 features = [
     "Win32_Foundation",
@@ -35,6 +35,13 @@ features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop", "xkbcommon"] }
+ab_glyph = "0.2"
+resvg = { version = "0.49", default-features = false }
+png = "0.18"
+libc = "0.2"
 
 [profile.release]
 opt-level = "s"

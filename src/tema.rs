@@ -1,14 +1,10 @@
-//! Temas da barra (cópia de `barra/src/tema.rs`, mesma ordem). A barra grava o índice do
-//! tema escolhido em HKCU\Software\barra\Tema; o lançador lê o mesmo valor ao abrir.
-
-use std::ffi::c_void;
-
-use windows::{
-    core::w,
-    Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
-};
+//! Temas da barra (cópia de `barra/src/tema.rs`, mesma ordem), que são os temas do Omarchy.
+//! No Windows, a barra grava o índice do tema escolhido em HKCU\Software\barra\Tema e o
+//! lançador lê o mesmo valor ao abrir. No KDE, o tema vem do esquema de cores ativo
+//! (`OmarchyMatteBlack` = `matte-black`, gravado pelo `omarchy-tema`).
 
 #[allow(dead_code)]
+#[derive(Clone, Copy)]
 pub struct Tema {
     pub nome: &'static str,
     pub claro: bool,
@@ -71,12 +67,36 @@ pub const TEMAS: &[Tema] = &[
     t!("white", true, 0xffffff, 0xc0c0c0, 0xc0c0c0, 0x808080, 0x000000, 0xc0c0c0, 0x000000, 0x6e6e6e, 0x2a2a2a, 0x4a4a4a, 0x3a3a3a),
 ];
 
+#[cfg(windows)]
 pub fn por_indice(i: u32) -> &'static Tema {
     TEMAS.get(i as usize).unwrap_or(&TEMAS[0])
 }
 
+/// Tema pelo nome do esquema de cores do KDE: "Omarchy" + nome em CamelCase.
+#[cfg(target_os = "linux")]
+pub fn por_esquema_kde(esquema: &str) -> Option<&'static Tema> {
+    let nome = esquema.strip_prefix("Omarchy")?;
+    TEMAS.iter().find(|t| {
+        let camel: String = t
+            .nome
+            .split('-')
+            .map(|p| {
+                let mut c = p.chars();
+                c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default()
+            })
+            .collect();
+        camel == nome
+    })
+}
+
 /// Tema escolhido no menu da barra; sem a chave, o primeiro (o padrão da barra).
+#[cfg(windows)]
 pub fn escolhido() -> &'static Tema {
+    use std::ffi::c_void;
+    use windows::{
+        core::w,
+        Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
+    };
     let mut v = 0u32;
     let mut tam = 4u32;
     let ok = unsafe {
